@@ -2996,8 +2996,8 @@ def print_job_verbose(job: dict, index: int, total: int):
 def _build_guest_api_url(keyword: str, start: int) -> str:
     kw = quote_plus(keyword)
     return (
-        "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
-        "?location=Algeria&f_TPR=r604800&keywords={kw}&start={start}"
+        f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+        f"?location=Algeria&f_TPR=r604800&keywords={kw}&start={start}"
     )
 
 def _collect_job_urls_from_cards(html: str, seen: set) -> list:
