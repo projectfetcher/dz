@@ -70,18 +70,11 @@ MISTRAL_URL     = "https://api.mistral.ai/v1/chat/completions"
 
 ENABLE_PARAPHRASE = True
 
-# ── Make.com → Facebook ──────────────────────────────────────────────────────
-MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL", "")
-MAKE_SECRET      = os.environ.get("MAKE_SECRET", "")   # optional shared secret
-MAX_FB_PER_RUN   = 10                                  # cap posts per run (0 = send none)
-_fb_sent         = 0
-
 # ── Startup warnings ─────────────────────────────────────────────────────────
 for _var, _val, _feature in [
     ("MISTRAL_API_KEY", MISTRAL_API_KEY, "paraphrasing"),
     ("WP_USERNAME",     WP_USER,         "WordPress posting"),
     ("WP_APP_PASSWORD", WP_PASSWORD,     "WordPress posting"),
-    ("MAKE_WEBHOOK_URL", MAKE_WEBHOOK_URL, "Facebook posting via Make"),
 ]:
     if not _val:
         logging.getLogger(__name__).warning(
@@ -2775,21 +2768,16 @@ def get_or_create_term(taxonomy_url: str, name: str) -> int | None:
         return None
 
 def post_job_to_wordpress(job: dict) -> tuple:
-    """
-    Returns (wp_id, wp_url, created)
-      created = True  → newly created on WordPress (send to Facebook)
-      created = False → already existed or failed (do NOT send to Facebook)
-    """
     if not WP_USER or not WP_PASSWORD:
         log.warning("WP_USERNAME / WP_APP_PASSWORD not set — skipping WordPress post")
-        return None, None, False
+        return None, None
 
     h = _wp_auth_headers()
 
     title       = sanitize_text(job.get("jobTitle", ""))
     description = sanitize_text(job.get("jobDescription", ""))
     if not title or not description:
-        return None, None, False
+        return None, None
 
     slug = re.sub(r"[^a-z0-9-]", "-", title.lower())[:80]
     try:
@@ -2798,7 +2786,7 @@ def post_job_to_wordpress(job: dict) -> tuple:
         posts = r.json()
         if isinstance(posts, list) and posts:
             log.info(f"⏭ Job already on WP: {title}")
-            return posts[0]["id"], posts[0].get("link"), False   # existing → not new
+            return posts[0]["id"], posts[0].get("link")
     except Exception:
         pass
 
@@ -2901,47 +2889,11 @@ def post_job_to_wordpress(job: dict) -> tuple:
             r.raise_for_status()
             post = r.json()
             log.info(f"✅ Job posted: '{title}' → WP ID {post.get('id')}")
-            return post.get("id"), post.get("link"), True        # newly created
+            return post.get("id"), post.get("link")
         except Exception as e:
             log.error(f"Job post attempt {attempt+1} failed: {e}")
             if attempt < 2: time.sleep(2 ** attempt)
-    return None, None, False
-
-# =============================================================================
-#  MAKE.COM → FACEBOOK
-# =============================================================================
-
-def send_to_make(job: dict, wp_id, wp_url: str) -> bool:
-    """Send a newly created job to Make so it can be posted on Facebook."""
-    global _fb_sent
-    if not MAKE_WEBHOOK_URL:
-        return False
-    if _fb_sent >= MAX_FB_PER_RUN:
-        log.info("Facebook cap reached for this run — skipping Make webhook")
-        return False
-
-    payload = {
-        "secret":   MAKE_SECRET,
-        "title":    job.get("jobTitle", ""),
-        "company":  job.get("companyName", ""),
-        "location": job.get("jobLocation", ""),
-        "job_type": job.get("jobType", ""),
-        "deadline": job.get("deadline", ""),
-        "apply":    job.get("application", ""),
-        "summary":  (job.get("jobDescription", "") or "")[:400],
-        "logo":     job.get("companyLogo", ""),
-        "wp_id":    wp_id,
-        "wp_url":   wp_url or "",
-    }
-    try:
-        r = requests.post(MAKE_WEBHOOK_URL, json=payload, timeout=15)
-        r.raise_for_status()
-        _fb_sent += 1
-        log.info(f"📣 Sent to Make (#{_fb_sent}): {payload['title']}")
-        return True
-    except Exception as e:
-        log.warning(f"Make webhook failed: {e}")
-        return False
+    return None, None
 
 # =============================================================================
 #  VERBOSE PRINTER
@@ -3141,7 +3093,6 @@ def craw():
     print(f"  Apply filter  : ❌ Privacy/Terms/Login URLs BLOCKED")
     print(f"  Company URL   : ✅ LinkedIn company page URL KEPT")
     print(f"  Logo priority : company-website logo > LinkedIn logo")
-    print(f"  Facebook/Make : {'✅ enabled (max ' + str(MAX_FB_PER_RUN) + ' per run)' if MAKE_WEBHOOK_URL else '❌ disabled (MAKE_WEBHOOK_URL not set)'}")
     print(f"  SSL warnings  : suppressed")
     print(f"  HuggingFace   : offline mode (cached model only)")
     print(f"  NLP available : {'✅' if _NLP_AVAILABLE else '⚠️  no sentence-transformers / language-tool'}")
@@ -3190,20 +3141,10 @@ def craw():
                     print_job_verbose(job, j+1, len(all_job_urls))
 
                     print(C_BLUE(f"\n  📤 Posting to WordPress …"))
-                    wp_id, wp_url, created = post_job_to_wordpress(job)
+                    wp_id, wp_url = post_job_to_wordpress(job)
                     if wp_id:
                         mark_posted(job["_jobId"], wp_id, wp_url or "")
                         print(C_GREEN(f"  ✅ WP ID={wp_id}  🔗 {wp_url}"))
-                        # Only NEW WordPress jobs go to Facebook (via Make)
-                        if created:
-                            print(C_BLUE("  📣 Sending to Make → Facebook …"))
-                            if send_to_make(job, wp_id, wp_url):
-                                print(C_GREEN("  ✅ Sent to Make"))
-                                time.sleep(3)
-                            else:
-                                print(C_DIM("  ⚠️  Not sent to Make (disabled, capped or failed)"))
-                        else:
-                            print(C_DIM("  ⏭  Already on WordPress — not sent to Facebook"))
                     else:
                         mark_failed(job["_jobId"], "wp_post_failed")
                         print(C_RED("  ❌ WordPress post failed"))
@@ -3226,7 +3167,6 @@ def craw():
     print(C_HEADER("  SCRAPE COMPLETE"))
     print(C_HEADER("=" * 72))
     print(f"  {C_LABEL('Total scraped')}  : {C_GREEN(str(len(jobs)))} jobs")
-    print(f"  {C_LABEL('Sent to Make')}   : {_fb_sent}")
     print(f"  {C_LABEL('Errors')}         : {C_RED(str(errors)) if errors else '0'}")
     print(f"  {C_LABEL('Duration')}       : ~{mins} min")
     print(f"  {C_LABEL('Output file')}    : {OUTPUT_FILE}")
