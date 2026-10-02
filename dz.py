@@ -696,33 +696,49 @@ def paraphrase_tagline(text: str) -> str:
 #  DUPLICATE TRACKER
 # =============================================================================
 
+TRACKER_COLUMNS = [
+    "Job ID", "Job URL", "Job Title", "Company Name",
+    "Status", "Timestamp", "WP ID",
+    "Short Description", "Location", "Job Type", "Job Site URL",
+]
+
+def _read_tracker() -> pd.DataFrame:
+    """Read tracker as strings so mixed/new columns never cause dtype errors."""
+    df = pd.read_csv(PROCESSED_IDS_FILE, dtype=str, keep_default_na=False)
+    for col in TRACKER_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[TRACKER_COLUMNS + [c for c in df.columns if c not in TRACKER_COLUMNS]]
+
 def _init_tracker():
+    """Create the tracker, or migrate an old one by adding the new columns."""
     if not os.path.exists(PROCESSED_IDS_FILE):
-        pd.DataFrame(columns=[
-            "Job ID", "Job URL", "Job Title", "Company Name",
-            "Status", "Timestamp", "WP ID",
-        ]).to_csv(PROCESSED_IDS_FILE, index=False)
+        pd.DataFrame(columns=TRACKER_COLUMNS).to_csv(PROCESSED_IDS_FILE, index=False)
+    else:
+        _read_tracker().to_csv(PROCESSED_IDS_FILE, index=False)
 
 def load_processed_ids() -> tuple:
     _init_tracker()
-    df = pd.read_csv(PROCESSED_IDS_FILE)
+    df = _read_tracker()
     return (
-        set(df["Job ID"].fillna("").astype(str)),
-        set(df.get("Job URL", pd.Series()).fillna("").astype(str)),
+        set(df["Job ID"].astype(str)),
+        set(df["Job URL"].astype(str)),
     )
 
 def _upsert_row(job_id: str, updates: dict):
     _init_tracker()
-    df   = pd.read_csv(PROCESSED_IDS_FILE)
+    df   = _read_tracker()
     mask = df["Job ID"].astype(str) == str(job_id)
     if mask.any():
         for col, val in updates.items():
             if col in df.columns:
-                df.loc[mask, col] = val
+                df.loc[mask, col] = "" if val is None else str(val)
         df.loc[mask, "Timestamp"] = datetime.now().isoformat()
     else:
-        row = {"Job ID": job_id, "Timestamp": datetime.now().isoformat()}
-        row.update(updates)
+        row = {c: "" for c in df.columns}
+        row["Job ID"] = job_id
+        row["Timestamp"] = datetime.now().isoformat()
+        row.update({k: ("" if v is None else str(v)) for k, v in updates.items() if k in row})
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     df.to_csv(PROCESSED_IDS_FILE, index=False)
 
@@ -739,8 +755,41 @@ def mark_scraped(job_id, job_url, title, company):
 def mark_paraphrased(job_id):
     _upsert_row(job_id, {"Status": "paraphrased"})
 
-def mark_posted(job_id, wp_id, wp_url):
-    _upsert_row(job_id, {"Status": "posted", "WP ID": wp_id})
+SHORT_DESC_LEN = 220
+
+def make_short_description(text: str, limit: int = SHORT_DESC_LEN) -> str:
+    """~220-char plain-text summary, cut on a word boundary."""
+    text = sanitize_text(text or "")
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"[\u2022\*\-]{1,2}\s+", "", text)      # bullets
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit - 1]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,;:.-") + "\u2026"
+
+def _pretty_job_type(raw: str) -> str:
+    t = JOB_TYPE_MAPPING.get((raw or "").lower().strip(), (raw or "").strip().lower())
+    return t.replace("-", " ").title() if t else ""
+
+def mark_posted(job_id, wp_id, wp_url, job: dict | None = None):
+    # Always store a usable WordPress URL (fallback to ?p=ID)
+    if not wp_url and wp_id and WP_BASE:
+        wp_url = f"{WP_BASE.replace('/wp-json/wp/v2', '')}/?p={wp_id}"
+    updates = {
+        "Status": "posted",
+        "WP ID": wp_id,
+        "Job Site URL": wp_url or "",
+    }
+    if job:
+        updates.update({
+            "Short Description": make_short_description(job.get("jobDescription", "")),
+            "Location":          sanitize_text(job.get("jobLocation", "")),
+            "Job Type":          _pretty_job_type(job.get("jobType", "")),
+        })
+    _upsert_row(job_id, updates)
 
 def mark_failed(job_id, reason):
     _upsert_row(job_id, {"Status": f"failed|{reason}"})
@@ -3143,7 +3192,7 @@ def craw():
                     print(C_BLUE(f"\n  📤 Posting to WordPress …"))
                     wp_id, wp_url = post_job_to_wordpress(job)
                     if wp_id:
-                        mark_posted(job["_jobId"], wp_id, wp_url or "")
+                        mark_posted(job["_jobId"], wp_id, wp_url or "", job)
                         print(C_GREEN(f"  ✅ WP ID={wp_id}  🔗 {wp_url}"))
                     else:
                         mark_failed(job["_jobId"], "wp_post_failed")
